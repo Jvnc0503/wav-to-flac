@@ -13,7 +13,7 @@ INPUT_DIR="${1:-.}"
 
 if [ ! -d "$INPUT_DIR" ]; then
     echo "Error: Directory '$INPUT_DIR' does not exist."
-    echo "Usage: $0 [path_to_folder_containing_wavs]"
+    echo "Usage: $0 [path_to_folder_containing_audio]"
     exit 1
 fi
 
@@ -21,17 +21,17 @@ fi
 export INPUT_DIR=$(realpath "$INPUT_DIR")
 export OUTPUT_DIR="$INPUT_DIR/Converted_FLAC"
 
-echo "--- Locating WAV files and starting Batch Conversion ---"
+echo "--- Locating WAV and FLAC files and starting Batch Conversion ---"
 mkdir -p "$OUTPUT_DIR"
 
-# Count files (case-insensitive for .wav, .WAV)
-FILE_COUNT=$(find "$INPUT_DIR" -maxdepth 1 -iname "*.wav" | wc -l)
+# Count files (case-insensitive for both .wav and .flac)
+FILE_COUNT=$(find "$INPUT_DIR" -maxdepth 1 \( -iname "*.wav" -o -iname "*.flac" \) | wc -l)
 if [ "$FILE_COUNT" -eq 0 ]; then
-    echo "Error: No .wav files found in '$INPUT_DIR'."
+    echo "Error: No .wav or .flac files found in '$INPUT_DIR'."
     exit 1
 fi
 
-echo "Found $FILE_COUNT files. Converting to FLAC using maximum compression..."
+echo "Found $FILE_COUNT files. Converting/Re-encoding to FLAC using maximum compression..."
 
 # --- The Conversion Function ---
 do_convert() {
@@ -45,7 +45,8 @@ do_convert() {
     # -y                  : Overwrite output files without asking.
     # -c:a flac           : Use the FLAC audio codec.
     # -compression_level 12 : Maximum compression (standard FLAC CLI max is 8, FFmpeg goes to 12).
-    #                       This takes more CPU time to encode, but decoding remains extremely fast.
+    #                       If the input is already a FLAC, this forces a re-encode to ensure
+    #                       maximum compression optimization is uniformly applied.
     ffmpeg -hide_banner -loglevel error -y -i "$input_file" \
     -c:a flac -compression_level 12 "$output_file"
 }
@@ -53,12 +54,12 @@ do_convert() {
 export -f do_convert
 
 # --- Execute Parallel ---
-find "$INPUT_DIR" -maxdepth 1 -iname "*.wav" -print0 | parallel -0 do_convert {}
+# The escaped parentheses \( ... \) group the OR (-o) condition so -maxdepth applies to both.
+find "$INPUT_DIR" -maxdepth 1 \( -iname "*.wav" -o -iname "*.flac" \) -print0 | parallel -0 do_convert {}
 
 echo "--- Analyzing Audio and Applying ReplayGain ---"
 
 # --- ReplayGain Album Detection Logic ---
-# Parses a playlist file to group specific tracks as a single "Album" for ReplayGain purposes.
 apply_rg_to_list() {
     local list_file="$1"
     local type="$2"
@@ -67,9 +68,7 @@ apply_rg_to_list() {
     echo "Detected $type: $(basename "$list_file"). Parsing for album grouping..."
 
     if [ "$type" == "CUE" ]; then
-        # Extract filenames from lines like: FILE "Track01.wav" WAVE
         while read -r line; do
-            # Using awk to split by quotes and grab the filename inside them
             local audio_name=$(echo "$line" | grep -i '^FILE' | awk -F '"' '{print $2}')
             if [ -n "$audio_name" ]; then
                 local base_name=$(basename "${audio_name%.*}")
@@ -80,9 +79,7 @@ apply_rg_to_list() {
         done < "$list_file"
 
     elif [ "$type" == "M3U" ]; then
-        # Read line by line, stripping carriage returns (Windows format safeguard)
         while read -r line; do
-            # Skip empty lines and comments (lines starting with #)
             if [[ -n "$line" && "$line" != \#* ]]; then
                 local base_name=$(basename "${line%.*}")
                 if [ -f "$OUTPUT_DIR/$base_name.flac" ]; then
@@ -92,7 +89,6 @@ apply_rg_to_list() {
         done < <(tr -d '\r' < "$list_file")
     fi
 
-    # Check if we successfully mapped playlist entries to actual output files
     if [ ${#flac_files[@]} -gt 0 ]; then
         echo "Applying ReplayGain to ${#flac_files[@]} files mapped from the $type playlist..."
         metaflac --add-replay-gain "${flac_files[@]}"
@@ -116,7 +112,7 @@ elif [ -n "$M3U_FILE" ]; then
     apply_rg_to_list "$M3U_FILE" "M3U" && RG_APPLIED=1
 fi
 
-# Fallback mechanism if no playlists are found or parsing yields no matching files
+# Fallback mechanism
 if [ "$RG_APPLIED" -eq 0 ]; then
     echo "No valid CUE/M3U mapping found. Treating all converted files as a single album..."
     metaflac --add-replay-gain "$OUTPUT_DIR"/*.flac
